@@ -4,7 +4,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
-import { app, httpServer } from "./socket.js";
+import { app, server } from "./socket.js";
 import cookieParser from "cookie-parser";
 
 import users from "./route/users.js"
@@ -99,7 +99,7 @@ const connectDb = async () => {
 
 connectDb()
   .then(() => {
-    httpServer.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`server running on port ${PORT}`);
     });
   })
