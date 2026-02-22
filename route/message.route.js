@@ -8,7 +8,7 @@ import {
     editMessage,
     getUnreadCount,
     searchMessages
-} from "./controllers/messages.controller.js";
+} from "./controllers/message.controller.js";
 
 const router = express.Router();
 
