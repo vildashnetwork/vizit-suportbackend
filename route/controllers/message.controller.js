@@ -459,86 +459,64 @@ export const getUsersForSidebar = async (req, res) => {
     try {
         const { loggedInUserId } = req.params;
 
-        console.log("Fetching users for sidebar. User ID:", loggedInUserId);
-
-        // Validate ID
-        if (!mongoose.Types.ObjectId.isValid(loggedInUserId)) {
-            return res.status(400).json({ error: "Invalid user ID format" });
-        }
-
-        // Find the user in either Admin or Users collection
-        let me = await Admin.findById(loggedInUserId).select('-password').lean();
-        if (!me) {
-            me = await Users.findById(loggedInUserId).select('-password').lean();
-        }
+        // Find the record in either Admin or Users collection
+        let me = await Admin.findById(loggedInUserId);
+        if (!me) me = await Users.findById(loggedInUserId);
 
         if (!me) {
-            console.log("User not found with ID:", loggedInUserId);
             return res.status(404).json({ message: "User not found" });
         }
 
-        console.log("User found:", me.name || me.email);
+        // Fetch profiles of people in the chat history
+        const filteredUsers = await Users.find().select('-password').lean();
+        const filteredAdmins = await Admin.find().select('-password').lean();
 
-        // Get all users and admins
-        const [allUsers, allAdmins] = await Promise.all([
-            Users.find().select('-password').lean(),
-            Admin.find().select('-password').lean()
-        ]);
+        // Get last message for each user
+        const usersWithLastMessage = await Promise.all(
+            filteredUsers.map(async (user) => {
+                const lastMessage = await Message.findOne({
+                    $or: [
+                        { senderId: loggedInUserId, receiverId: user._id },
+                        { senderId: user._id, receiverId: loggedInUserId }
+                    ]
+                }).sort({ createdAt: -1 }).lean();
 
-        // Combine and filter out current user
-        let allContacts = [...allUsers, ...allAdmins].filter(
-            contact => contact._id.toString() !== loggedInUserId
+                return {
+                    ...user,
+                    lastMessage: lastMessage?.text || null,
+                    lastMessageTime: lastMessage?.createdAt || null
+                };
+            })
         );
 
-        console.log(`Found ${allContacts.length} potential contacts`);
+        // Get last message for each admin
+        const adminsWithLastMessage = await Promise.all(
+            filteredAdmins.map(async (admin) => {
+                const lastMessage = await Message.findOne({
+                    $or: [
+                        { senderId: loggedInUserId, receiverId: admin._id },
+                        { senderId: admin._id, receiverId: loggedInUserId }
+                    ]
+                }).sort({ createdAt: -1 }).lean();
 
-        // Get last messages for each contact (simplified)
-        const contactsWithMessages = [];
-
-        for (const contact of allContacts) {
-            // Find last message between current user and this contact
-            const lastMessage = await Message.findOne({
-                $or: [
-                    { senderId: loggedInUserId, receiverId: contact._id.toString() },
-                    { senderId: contact._id.toString(), receiverId: loggedInUserId }
-                ]
-            }).sort({ createdAt: -1 }).lean();
-
-            // Count unread messages
-            const unreadCount = await Message.countDocuments({
-                senderId: contact._id.toString(),
-                receiverId: loggedInUserId,
-                readistrue: false
-            });
-
-            contactsWithMessages.push({
-                ...contact,
-                lastMessage: lastMessage?.text || null,
-                lastMessageTime: lastMessage?.createdAt || null,
-                lastMessageType: lastMessage?.messageType || null,
-                unreadCount
-            });
-        }
-
-        // Sort by last message time (most recent first)
-        contactsWithMessages.sort((a, b) => {
-            const timeA = a.lastMessageTime ? new Date(a.lastMessageTime).getTime() : 0;
-            const timeB = b.lastMessageTime ? new Date(b.lastMessageTime).getTime() : 0;
-            return timeB - timeA;
-        });
-
-        console.log(`Returning ${contactsWithMessages.length} contacts`);
+                return {
+                    ...admin,
+                    lastMessage: lastMessage?.text || null,
+                    lastMessageTime: lastMessage?.createdAt || null
+                };
+            })
+        );
 
         res.status(200).json({
-            contacts: contactsWithMessages,
-            totalContacts: contactsWithMessages.length
+            filteredUsers: usersWithLastMessage,
+            filteredAdmins: adminsWithLastMessage
         });
-
     } catch (error) {
         console.error("Error in getUsersForSidebar: ", error);
-        res.status(500).json({ error: error.message || "Internal Server Error" });
+        res.status(500).json({ error: error.message });
     }
 };
+
 
 /**
  * GET MESSAGES - SIMPLIFIED WORKING VERSION
