@@ -1,0 +1,1570 @@
+import { useState, useRef, useEffect, useCallback } from "react";
+import { io, Socket } from "socket.io-client";
+import { useNavigate } from "react-router-dom";
+import {
+  Send, Settings, LogOut, MessageCircle, Paperclip, X, FileText,
+  Loader2, Check, CheckCheck, User, MoreVertical, Phone, Video,
+  Smile, Mic, CornerDownLeft, Clock, AlertCircle, Menu, ChevronLeft,
+  Image as ImageIcon, Film, Download, Share2, Copy, CheckCircle,
+  Wifi, WifiOff, Bell, BellOff, Moon, Sun, Globe
+} from "lucide-react";
+
+// --- CONFIG ---
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:4000";
+const CLOUDINARY_UPLOAD_PRESET = "vizit-image";
+const CLOUDINARY_CLOUD_NAME = "dgigs6v72";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
+
+// Types
+interface Attachment {
+  id: string;
+  file: File;
+  url?: string;
+  preview?: string;
+  type: "image" | "video" | "document";
+  name?: string;
+  size?: number;
+  progress?: number;
+}
+
+interface Message {
+  _id?: string;
+  id: string;
+  text: string;
+  senderId: string;
+  receiverId?: string;
+  sender: "user" | "agent" | "system";
+  timestamp: Date;
+  userName?: string;
+  userProfile?: string;
+  attachments?: Attachment[];
+  documents?: string[];
+  readistrue?: boolean;
+  status?: "sending" | "sent" | "delivered" | "read" | "failed";
+  isEdited?: boolean;
+  replyTo?: string;
+  messageType?: "text" | "image" | "video" | "document";
+}
+
+interface User {
+  _id: string;
+  name: string;
+  profile?: string;
+  role?: "user" | "admin";
+  lastSeen?: Date;
+  isOnline?: boolean;
+  unreadCount?: number;
+  lastMessage?: string;
+  lastMessageTime?: Date;
+  email?: string;
+}
+
+interface TypingStatus {
+  byUserId: string;
+  isTyping: boolean;
+}
+
+interface ChatUser extends User {
+  type: 'admin';
+}
+
+// Storage keys
+const STORAGE_KEYS = {
+  USER: "vizit_user",
+  USER_ID: "vizit_user_id",
+  USER_NAME: "vizit_user_name",
+  THEME: "vizit_theme",
+  NOTIFICATIONS: "vizit_notifications",
+  SOUND: "vizit_sound"
+};
+
+export default function VizitChat() {
+  // User state
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [userName, setUserName] = useState<string>("");
+  const [nameInput, setNameInput] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [isLoadingChats, setIsLoadingChats] = useState(false);
+
+
+  const navigate = useNavigate()
+  // Chat state
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [draft, setDraft] = useState("");
+  const [isUploading, setIsUploading] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [isAdminOnline, setIsAdminOnline] = useState(false);
+  const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
+  const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
+  const [activeChat, setActiveChat] = useState<ChatUser | null>(null);
+  const [chatHistory, setChatHistory] = useState<ChatUser[]>([]);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({});
+  const [isConnected, setIsConnected] = useState(true);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [soundEnabled, setSoundEnabled] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.SOUND);
+    return saved !== null ? saved === 'true' : true;
+  });
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [filter, setFilter] = useState<"all" | "unread">("all");
+  const [isDarkMode, setIsDarkMode] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.THEME);
+    return saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+  });
+
+  // Refs
+  const socketRef = useRef<Socket | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout>();
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const messageIdsRef = useRef<Set<string>>(new Set()); // Track all message IDs
+
+  // Initialize Audio Context for sounds
+  useEffect(() => {
+    try {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    } catch (error) {
+      console.warn('Web Audio API not supported:', error);
+    }
+
+    return () => {
+      audioContextRef.current?.close();
+    };
+  }, []);
+
+  // Play sound utility
+  const playSound = (type: 'send' | 'receive' | 'newTicket') => {
+    if (!soundEnabled || !audioContextRef.current) return;
+
+    try {
+      const audioContext = audioContextRef.current;
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+
+      if (type === 'send') {
+        oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
+        gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.1);
+        oscillator.start(audioContext.currentTime);
+        oscillator.stop(audioContext.currentTime + 0.1);
+      } else if (type === 'receive') {
+        oscillator.frequency.setValueAtTime(600, audioContext.currentTime);
+        oscillator.frequency.setValueAtTime(800, audioContext.currentTime + 0.05);
+        gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.15);
+        oscillator.start(audioContext.currentTime);
+        oscillator.stop(audioContext.currentTime + 0.15);
+      } else if (type === 'newTicket') {
+        oscillator.frequency.setValueAtTime(400, audioContext.currentTime);
+        oscillator.frequency.setValueAtTime(600, audioContext.currentTime + 0.1);
+        oscillator.frequency.setValueAtTime(800, audioContext.currentTime + 0.2);
+        gainNode.gain.setValueAtTime(0.15, audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
+        oscillator.start(audioContext.currentTime);
+        oscillator.stop(audioContext.currentTime + 0.3);
+      }
+    } catch (error) {
+      console.warn('Could not play sound:', error);
+    }
+  };
+
+  // Load user from localStorage on mount
+  useEffect(() => {
+    const loadUser = async () => {
+      try {
+        const storedUserId = localStorage.getItem(STORAGE_KEYS.USER_ID);
+        const storedUserName = localStorage.getItem(STORAGE_KEYS.USER_NAME);
+
+        if (storedUserId && storedUserName) {
+          const response = await fetch(`${API_URL}/user/get-user/${storedUserId}`);
+          if (response.ok) {
+            const data = await response.json();
+            setCurrentUser(data.user);
+            setUserName(storedUserName);
+          } else {
+            localStorage.removeItem(STORAGE_KEYS.USER_ID);
+            localStorage.removeItem(STORAGE_KEYS.USER_NAME);
+            localStorage.removeItem(STORAGE_KEYS.USER);
+          }
+        }
+      } catch (error) {
+        console.error("Failed to load user:", error);
+      }
+    };
+    loadUser();
+
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+
+    const notifPref = localStorage.getItem(STORAGE_KEYS.NOTIFICATIONS);
+    if (notifPref) {
+      setNotificationsEnabled(notifPref === 'true');
+    }
+
+    const soundPref = localStorage.getItem(STORAGE_KEYS.SOUND);
+    if (soundPref) {
+      setSoundEnabled(soundPref === 'true');
+    }
+  }, []);
+
+  // Apply dark mode
+  useEffect(() => {
+    if (isDarkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    localStorage.setItem(STORAGE_KEYS.THEME, isDarkMode ? 'dark' : 'light');
+  }, [isDarkMode]);
+
+  // Initialize Socket connection
+  useEffect(() => {
+    if (!currentUser?._id) return;
+
+    socketRef.current = io(SOCKET_URL, {
+      auth: {
+        userId: currentUser._id,
+        userName: currentUser.name,
+        role: currentUser.role || 'user',
+        profile: currentUser.profile
+      },
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000
+    });
+
+    const socket = socketRef.current;
+
+    socket.on("connect", () => {
+      console.log("Socket connected");
+      setIsConnected(true);
+      setError(null);
+      showNotification("Connected", "You're back online!", "success");
+    });
+
+    socket.on("disconnect", () => {
+      console.log("Socket disconnected");
+      setIsConnected(false);
+      setError("Connection lost. Reconnecting...");
+    });
+
+    socket.on("connect_error", (err) => {
+      console.error("Socket connection error:", err);
+      setIsConnected(false);
+      setError("Connection lost. Reconnecting...");
+    });
+
+    // Handle new messages - STRICT DUPLICATE PREVENTION
+    socket.on("newMessage", (msg: Message) => {
+      const messageId = msg._id || msg.id;
+
+      // CRITICAL: If we already have this message, ignore it completely
+      if (messageIdsRef.current.has(messageId)) {
+        console.log("Duplicate message ignored:", messageId);
+        return;
+      }
+
+      // Add to tracking set
+      messageIdsRef.current.add(messageId);
+
+      const sender = msg.senderId === currentUser?._id ? "user" : "agent";
+
+      const newMsg = {
+        ...msg,
+        id: messageId,
+        timestamp: new Date(msg.timestamp || new Date()),
+        sender: sender,
+        status: msg.status || (sender === "user" ? "sent" : "delivered")
+      };
+
+      // Play sound for received messages
+      if (soundEnabled && msg.senderId !== currentUser?._id) {
+        playSound('receive');
+      }
+
+      // Show notification
+      if (notificationsEnabled &&
+        msg.senderId !== currentUser?._id &&
+        document.hidden) {
+        showNotification(
+          `New message from ${msg.userName || 'Support'}`,
+          msg.text || 'Sent an attachment',
+          'info'
+        );
+      }
+
+      // Add to messages
+      setMessages(prev => [...prev, newMsg]);
+
+      // Update sidebar
+      setChatHistory(prev =>
+        prev.map(chat =>
+          chat._id === msg.senderId || chat._id === msg.receiverId
+            ? {
+              ...chat,
+              lastMessage: msg.text || '📎 Attachment',
+              lastMessageTime: new Date(),
+              unreadCount: msg.senderId !== currentUser?._id ? (chat.unreadCount || 0) + 1 : chat.unreadCount
+            }
+            : chat
+        )
+      );
+    });
+
+    // Status events
+    socket.on("admin_status", (status: { online: boolean }) => {
+      setIsAdminOnline(status.online);
+    });
+
+    socket.on("getOnlineUsers", (users: string[]) => {
+      setOnlineUsers(users);
+    });
+
+    socket.on("typingStatus", (status: TypingStatus) => {
+      setTypingUsers(prev => {
+        const next = new Set(prev);
+        if (status.isTyping) {
+          next.add(status.byUserId);
+        } else {
+          next.delete(status.byUserId);
+        }
+        return next;
+      });
+    });
+
+    // Read receipt events
+    socket.on("messagesRead", (data: { byUserId: string; chatUserId: string; messageIds: string[] }) => {
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.senderId === currentUser?._id &&
+            msg.receiverId === data.byUserId &&
+            data.messageIds.includes(msg._id || msg.id)
+            ? { ...msg, readistrue: true, status: "read" }
+            : msg
+        )
+      );
+
+      setChatHistory(prev =>
+        prev.map(chat =>
+          chat._id === data.byUserId
+            ? { ...chat, unreadCount: 0 }
+            : chat
+        )
+      );
+    });
+
+    socket.on("message_status_update", (data: { messageId: string; status: string }) => {
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.id === data.messageId || msg._id === data.messageId
+            ? { ...msg, readistrue: data.status === "read", status: data.status as any }
+            : msg
+        )
+      );
+    });
+
+    // Load chat history
+    loadChatHistory();
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [currentUser, notificationsEnabled, soundEnabled]);
+
+  // Load chat history - ONLY ADMINS
+  const loadChatHistory = async () => {
+    if (!currentUser?._id) return;
+
+    setIsLoadingChats(true);
+    try {
+      const response = await fetch(`${API_URL}/messages/users/${currentUser._id}`);
+      if (response.ok) {
+        const data = await response.json();
+
+        const admins = (data.filteredAdmins || []).map((a: any) => ({
+          ...a,
+          type: 'admin' as const,
+          role: 'admin',
+          isOnline: onlineUsers.includes(a._id),
+          lastMessage: a.lastMessage,
+          lastMessageTime: a.lastMessageTime ? new Date(a.lastMessageTime) : undefined,
+          unreadCount: a.unreadCount || 0
+        }));
+
+        setChatHistory(admins);
+
+        if (admins.length > 0 && !activeChat) {
+          setActiveChat(admins[0]);
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load chat history:", error);
+    } finally {
+      setIsLoadingChats(false);
+    }
+  };
+
+  // Load messages for active chat
+  useEffect(() => {
+    if (!activeChat?._id || !currentUser?._id) return;
+
+    const loadMessages = async () => {
+      try {
+        const response = await fetch(
+          `${API_URL}/messages/${activeChat._id}?myId=${currentUser._id}`
+        );
+        if (response.ok) {
+          const data = await response.json();
+
+          // Clear existing message IDs for this chat
+          const newMessageIds = new Set<string>();
+
+          const processedMessages = data.map((msg: any) => {
+            newMessageIds.add(msg._id);
+
+            const attachments = msg.documents?.map((url: string, index: number) => {
+              const urlParts = url.split('/');
+              const filename = urlParts[urlParts.length - 1] || `file-${index}`;
+              const extension = filename.split('.').pop()?.toLowerCase() || '';
+
+              let type: "image" | "video" | "document" = "document";
+              if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(extension)) {
+                type = "image";
+              } else if (['mp4', 'webm', 'ogg', 'mov', 'avi'].includes(extension)) {
+                type = "video";
+              }
+
+              return {
+                id: `att-${msg._id}-${index}`,
+                url,
+                type,
+                name: filename
+              };
+            }) || [];
+
+            return {
+              ...msg,
+              id: msg._id,
+              timestamp: new Date(msg.createdAt),
+              sender: msg.senderId === currentUser._id ? "user" : "agent",
+              readistrue: msg.readistrue || false,
+              status: msg.readistrue ? "read" : (msg.senderId === currentUser._id ? "sent" : "delivered"),
+              attachments,
+              documents: msg.documents || []
+            };
+          });
+
+          // Update message IDs
+          messageIdsRef.current = newMessageIds;
+
+          setMessages(processedMessages);
+
+          const unreadMessageIds = processedMessages
+            .filter((msg: Message) => msg.senderId !== currentUser._id && !msg.readistrue)
+            .map((msg: Message) => msg._id)
+            .filter(Boolean);
+
+          if (unreadMessageIds.length > 0 && socketRef.current) {
+            socketRef.current.emit("mark_as_read", {
+              messageIds: unreadMessageIds,
+              chatUserId: activeChat._id
+            });
+          }
+        }
+      } catch (error) {
+        console.error("Failed to load messages:", error);
+      }
+    };
+
+    loadMessages();
+  }, [activeChat, currentUser]);
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // Handle typing indicator
+  useEffect(() => {
+    if (!socketRef.current || !activeChat) return;
+
+    if (draft.trim()) {
+      socketRef.current.emit("typing", {
+        chatUserId: activeChat._id,
+        isTyping: true
+      });
+
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+
+      typingTimeoutRef.current = setTimeout(() => {
+        socketRef.current?.emit("typing", {
+          chatUserId: activeChat._id,
+          isTyping: false
+        });
+      }, 2000);
+    } else {
+      socketRef.current.emit("typing", {
+        chatUserId: activeChat._id,
+        isTyping: false
+      });
+    }
+
+    return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+    };
+  }, [draft, activeChat]);
+
+  // Filter chat history
+  const filteredChatHistory = chatHistory.filter(chat => {
+    const matchesSearch = chat.name.toLowerCase().includes(searchTerm.toLowerCase());
+    const matchesFilter = filter === 'all' ? true :
+      filter === 'unread' ? (chat.unreadCount || 0) > 0 : true;
+    return matchesSearch && matchesFilter;
+  });
+
+  // Show notification
+  const showNotification = (title: string, body: string, type: 'success' | 'error' | 'info') => {
+    if (!notificationsEnabled) return;
+
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification(title, { body, icon: '/logo.png' });
+    }
+
+    if (type === 'error') {
+      setError(body);
+      setTimeout(() => setError(null), 5000);
+    } else if (type === 'success') {
+      setSuccess(body);
+      setTimeout(() => setSuccess(null), 3000);
+    }
+  };
+
+  // Cloudinary Upload with Progress
+  const uploadToCloudinary = async (file: File): Promise<string> => {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+
+    const isVideo = file.type.startsWith("video/");
+    const resourceType = isVideo ? "video" : "image";
+
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+
+      xhr.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable) {
+          const progress = Math.round((event.loaded / event.total) * 100);
+          setUploadProgress(prev => ({ ...prev, [file.name]: progress }));
+        }
+      });
+
+      xhr.addEventListener("load", () => {
+        if (xhr.status === 200) {
+          const data = JSON.parse(xhr.responseText);
+          setUploadProgress(prev => {
+            const next = { ...prev };
+            delete next[file.name];
+            return next;
+          });
+          resolve(data.secure_url);
+        } else {
+          reject(new Error("Upload failed"));
+        }
+      });
+
+      xhr.addEventListener("error", () => reject(new Error("Upload failed")));
+      xhr.open("POST", `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`);
+      xhr.send(formData);
+    });
+  };
+
+  // Handle user login/signup
+  const handleIdentify = async () => {
+    if (!nameInput.trim()) return;
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_URL}/user/log-add`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: nameInput.trim() })
+      });
+
+      if (!response.ok) throw new Error("Failed to create user");
+
+      const data = await response.json();
+
+      localStorage.setItem(STORAGE_KEYS.USER_ID, data.user._id);
+      localStorage.setItem(STORAGE_KEYS.USER_NAME, data.user.name);
+      localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(data.user));
+
+      setCurrentUser(data.user);
+      setUserName(data.user.name);
+      setNameInput("");
+
+      showNotification("Welcome!", `You're now logged in as ${data.user.name}`, "success");
+    } catch (error) {
+      console.error("Login failed:", error);
+      setError("Failed to login. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Handle sending messages - SIMPLIFIED
+  const handleSend = async () => {
+    const trimmed = draft.trim();
+    if ((!trimmed && attachments.length === 0) || !currentUser || !activeChat) return;
+
+    setIsUploading(true);
+    const tempId = crypto.randomUUID();
+
+    // Create temp message with unique ID
+    const tempMessage: Message = {
+      id: tempId,
+      text: trimmed,
+      sender: "user",
+      senderId: currentUser._id,
+      receiverId: activeChat._id,
+      timestamp: new Date(),
+      userName: currentUser.name,
+      userProfile: currentUser.profile,
+      attachments: attachments.map(a => ({ id: a.id, type: a.type, name: a.file.name })),
+      status: "sending"
+    };
+    // navigate("/", { replace: true })
+
+    // Add temp message to state
+    setMessages(prev => [...prev, tempMessage]);
+
+    // Clear input
+    setDraft("");
+    const currentAttachments = [...attachments];
+    setAttachments([]);
+
+
+    try {
+      // Upload attachments if any
+      const uploadedUrls = await Promise.all(
+        currentAttachments.map(async (att) => {
+          const url = await uploadToCloudinary(att.file);
+          return url;
+        })
+      );
+
+      // Prepare message data
+      const messageData = {
+        text: trimmed,
+        senderId: currentUser._id,
+        receiverId: activeChat._id,
+        documents: uploadedUrls,
+        timestamp: new Date().toISOString(),
+        userName: currentUser.name,
+        userProfile: currentUser.profile
+      };
+
+      // Send via API
+      const response = await fetch(`${API_URL}/messages/send/${activeChat._id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(messageData)
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to send message");
+      }
+
+      const savedMessage = await response.json();
+
+      // Add to message IDs set
+      messageIdsRef.current.add(savedMessage._id);
+
+      // Process attachments for display
+      const processedAttachments = savedMessage.documents?.map((url: string, index: number) => ({
+        id: `att-${savedMessage._id}-${index}`,
+        url,
+        type: currentAttachments[index]?.type || "document",
+        name: currentAttachments[index]?.name || `file-${index}`
+      })) || [];
+
+      // Remove temp message and add the real one
+      setMessages(prev => {
+        // First, remove the temp message
+        const filtered = prev.filter(msg => msg.id !== tempId);
+        // Then add the real message
+        return [...filtered, {
+          ...savedMessage,
+          id: savedMessage._id,
+          timestamp: new Date(savedMessage.createdAt),
+          sender: "user",
+          attachments: processedAttachments,
+          documents: savedMessage.documents || [],
+          status: "sent"
+        }];
+      });
+
+      // Play sound
+      if (soundEnabled) {
+        playSound('send');
+      }
+
+      // Update sidebar
+      setChatHistory(prev =>
+        prev.map(chat =>
+          chat._id === activeChat._id
+            ? {
+              ...chat,
+              lastMessage: trimmed || '📎 Attachment',
+              lastMessageTime: new Date()
+            }
+            : chat
+        )
+      );
+
+    } catch (error) {
+      console.error("Send failed", error);
+
+      // Mark message as failed
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.id === tempId
+            ? { ...msg, status: "failed" }
+            : msg
+        )
+      );
+
+      setError("Failed to send message. Please try again.");
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  // Handle file selection
+  const handleFilePick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    Array.from(files).forEach((file) => {
+      if (file.size > 10 * 1024 * 1024) {
+        setError("File too large. Maximum size is 10MB.");
+        return;
+      }
+
+      const type = file.type.startsWith("image/") ? "image"
+        : file.type.startsWith("video/") ? "video"
+          : "document";
+
+      const att: Attachment = {
+        id: crypto.randomUUID(),
+        file,
+        type,
+        name: file.name,
+        size: file.size
+      };
+
+      if (type !== "document") {
+        const reader = new FileReader();
+        reader.onload = () => {
+          att.preview = reader.result as string;
+          setAttachments(prev => [...prev, att]);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        setAttachments(prev => [...prev, att]);
+      }
+    });
+
+    e.target.value = "";
+  };
+
+  // Remove attachment
+  const removeAttachment = (id: string) => {
+    setAttachments(prev => prev.filter(a => a.id !== id));
+  };
+
+  // Handle logout
+  const handleLogout = () => {
+    localStorage.removeItem(STORAGE_KEYS.USER_ID);
+    localStorage.removeItem(STORAGE_KEYS.USER_NAME);
+    localStorage.removeItem(STORAGE_KEYS.USER);
+    setCurrentUser(null);
+    setUserName("");
+    setMessages([]);
+    setChatHistory([]);
+    setActiveChat(null);
+    messageIdsRef.current.clear();
+    socketRef.current?.disconnect();
+    showNotification("Logged out", "You've been successfully logged out", "info");
+  };
+
+  // Download attachment
+  const downloadAttachment = (url: string, filename: string) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  // Format timestamp
+  const formatMessageTime = (date: Date) => {
+    const now = new Date();
+    const diff = now.getTime() - date.getTime();
+    const minutes = Math.floor(diff / (1000 * 60));
+
+    if (minutes < 1) return 'Just now';
+    if (minutes < 60) return `${minutes}m ago`;
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
+  const formatChatTime = (date?: Date) => {
+    if (!date) return '';
+    const now = new Date();
+    const diff = now.getTime() - date.getTime();
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+
+    if (days === 0) {
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } else if (days === 1) {
+      return 'Yesterday';
+    } else {
+      return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    }
+  };
+
+  // Render message status
+  const renderMessageStatus = (msg: Message) => {
+    if (msg.sender !== "user") return null;
+
+    switch (msg.status) {
+      case "sending":
+        return <Clock size={12} className="text-gray-400" />;
+      case "sent":
+        return <Check size={12} className="text-gray-400" />;
+      case "delivered":
+        return <CheckCheck size={12} className="text-gray-400" />;
+      case "read":
+        return <CheckCheck size={12} className="text-blue-500" />;
+      case "failed":
+        return <AlertCircle size={12} className="text-red-500" />;
+      default:
+        return msg.readistrue
+          ? <CheckCheck size={12} className="text-blue-500" />
+          : <Check size={12} className="text-gray-400" />;
+    }
+  };
+
+  // Copy message to clipboard
+  const copyMessage = (text: string) => {
+    navigator.clipboard.writeText(text);
+    setSuccess("Message copied to clipboard!");
+    setTimeout(() => setSuccess(null), 2000);
+  };
+
+  // Login screen
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-800 flex items-center justify-center p-4">
+        <div className="w-full max-w-sm">
+          <div className="text-center mb-8">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500 to-emerald-600 text-white mb-3 shadow-lg">
+              <MessageCircle size={32} />
+            </div>
+            <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
+              Vizit Support
+            </h1>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+              Connect with our team instantly
+            </p>
+          </div>
+
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-5">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              Enter your name to continue
+            </h2>
+
+            {error && (
+              <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                <div className="text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
+                  <AlertCircle size={16} />
+                  <span>{error}</span>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <input
+                type="text"
+                value={nameInput}
+                onChange={(e) => setNameInput(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && handleIdentify()}
+                placeholder="Your name"
+                className="w-full px-4 py-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-white focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none text-sm"
+                autoFocus
+              />
+
+              <button
+                onClick={handleIdentify}
+                disabled={isLoading || !nameInput.trim()}
+                className="w-full py-3 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-sm"
+              >
+                {isLoading ? (
+                  <>
+                    <Loader2 className="animate-spin" size={18} />
+                    <span>Please wait...</span>
+                  </>
+                ) : (
+                  <>
+                    <MessageCircle size={18} />
+                    <span>Start Chatting</span>
+                  </>
+                )}
+              </button>
+
+              <p className="text-xs text-center text-gray-500 dark:text-gray-400 pt-2">
+                By continuing, you agree to our Terms of Service
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={() => setIsDarkMode(!isDarkMode)}
+            className="absolute top-4 right-4 p-2 rounded-lg bg-white dark:bg-gray-800 shadow-lg"
+          >
+            {isDarkMode ? <Sun size={20} /> : <Moon size={20} />}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Main chat interface
+  return (
+    <div className="h-screen flex flex-col bg-gray-50 dark:bg-gray-900">
+      {/* Top Bar */}
+      <div className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-3 py-2 flex items-center gap-2 shadow-sm">
+        <button
+          onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+          className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+        >
+          <Menu size={20} className="text-gray-700 dark:text-gray-300" />
+        </button>
+
+        {activeChat ? (
+          <div className="flex-1 flex items-center gap-2 min-w-0">
+            <div className="relative">
+              {activeChat.profile ? (
+                <img
+                  src={activeChat.profile}
+                  alt={activeChat.name}
+                  className="w-8 h-8 rounded-full object-cover"
+                />
+              ) : (
+                <div className="w-8 h-8 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
+                  <User size={14} className="text-emerald-600 dark:text-emerald-400" />
+                </div>
+              )}
+              <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-white dark:border-gray-800 ${onlineUsers.includes(activeChat._id) ? 'bg-green-500' : 'bg-gray-400'
+                }`} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-gray-900 dark:text-white truncate text-sm">
+                {activeChat.name}
+                <span className="ml-2 text-xs bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 px-1.5 py-0.5 rounded-full">
+                  Admin
+                </span>
+              </div>
+              {typingUsers.has(activeChat._id) && (
+                <div className="text-xs text-emerald-600 dark:text-emerald-400 animate-pulse">
+                  Typing...
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1">
+            <div className="text-sm text-gray-500 dark:text-gray-400">Select an admin to chat with</div>
+          </div>
+        )}
+
+        <div className="flex items-center gap-1">
+          <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'} animate-pulse`} />
+
+          <div className="hidden sm:flex items-center gap-1.5 px-2 py-1.5 bg-gray-100 dark:bg-gray-700 rounded-full">
+            <div className={`w-1.5 h-1.5 rounded-full ${isAdminOnline ? 'bg-green-500' : 'bg-gray-400'}`} />
+            <span className="text-xs font-medium text-gray-600 dark:text-gray-300">
+              {isAdminOnline ? 'Online' : 'Offline'}
+            </span>
+          </div>
+
+          <button
+            onClick={() => setShowSettings(true)}
+            className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+          >
+            <Settings size={18} className="text-gray-700 dark:text-gray-300" />
+          </button>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Sidebar */}
+        <div className={`
+          fixed inset-0 z-20 bg-black/50 transition-opacity duration-300
+          ${isSidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}
+          sm:static sm:opacity-100 sm:pointer-events-auto sm:bg-transparent
+          sm:w-80 sm:border-r sm:border-gray-200 dark:sm:border-gray-700
+        `}>
+          <div className={`
+            absolute top-0 left-0 h-full w-4/5 max-w-xs bg-white dark:bg-gray-800
+            transform transition-transform duration-300 ease-in-out
+            ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+            sm:relative sm:translate-x-0 sm:w-full sm:max-w-none
+            flex flex-col
+          `}>
+            <div className="p-3 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+              <h2 className="font-semibold text-gray-900 dark:text-white text-sm">Support Admins</h2>
+              <button
+                onClick={() => setIsSidebarOpen(false)}
+                className="sm:hidden p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
+              >
+                <ChevronLeft size={18} />
+              </button>
+            </div>
+
+            <div className="p-3 bg-gray-50 dark:bg-gray-900/50 border-b border-gray-200 dark:border-gray-700">
+              <div className="flex items-center gap-2">
+                {currentUser.profile ? (
+                  <img
+                    src={currentUser.profile}
+                    alt={currentUser.name}
+                    className="w-10 h-10 rounded-full object-cover"
+                  />
+                ) : (
+                  <div className="w-10 h-10 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
+                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                      {currentUser.name.charAt(0).toUpperCase()}
+                    </span>
+                  </div>
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-gray-900 dark:text-white truncate text-sm">
+                    {currentUser.name}
+                  </div>
+                  <div className="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-1">
+                    <div className={`w-1.5 h-1.5 rounded-full ${onlineUsers.includes(currentUser._id) ? 'bg-green-500' : 'bg-gray-400'}`} />
+                    <span>{onlineUsers.includes(currentUser._id) ? 'Online' : 'Offline'}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-3 space-y-2">
+              <input
+                type="search"
+                placeholder="Search admins..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none"
+              />
+              <div className="flex gap-1">
+                {(['all', 'unread'] as const).map((f) => (
+                  <button
+                    key={f}
+                    onClick={() => setFilter(f)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${filter === f
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300'
+                      }`}
+                  >
+                    {f.charAt(0).toUpperCase() + f.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto">
+              {isLoadingChats ? (
+                <div className="flex items-center justify-center p-4">
+                  <Loader2 className="animate-spin text-emerald-600" size={24} />
+                </div>
+              ) : filteredChatHistory.length > 0 ? (
+                filteredChatHistory.map((admin) => (
+                  <button
+                    key={admin._id}
+                    onClick={() => {
+                      setActiveChat(admin);
+                      setIsSidebarOpen(false);
+                    }}
+                    className={`
+                      w-full p-3 flex items-center gap-2 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors
+                      ${activeChat?._id === admin._id ? 'bg-emerald-50 dark:bg-emerald-900/20 border-l-4 border-emerald-600' : ''}
+                    `}
+                  >
+                    <div className="relative">
+                      {admin.profile ? (
+                        <img
+                          src={admin.profile}
+                          alt={admin.name}
+                          className="w-10 h-10 rounded-full object-cover"
+                        />
+                      ) : (
+                        <div className="w-10 h-10 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
+                          <User size={16} className="text-emerald-600 dark:text-emerald-400" />
+                        </div>
+                      )}
+                      <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-white dark:border-gray-800 ${onlineUsers.includes(admin._id) ? 'bg-green-500' : 'bg-gray-400'
+                        }`} />
+                    </div>
+                    <div className="flex-1 min-w-0 text-left">
+                      <div className="flex items-center justify-between gap-1">
+                        <div className="font-medium text-gray-900 dark:text-white truncate text-sm">
+                          {admin.name}
+                          <span className="ml-1 text-[10px] bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 px-1 py-0.5 rounded-full">
+                            Admin
+                          </span>
+                        </div>
+                        {admin.lastMessageTime && (
+                          <span className="text-[10px] text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                            {formatChatTime(admin.lastMessageTime)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <div className="text-xs text-gray-500 dark:text-gray-400 truncate max-w-[120px]">
+                          {typingUsers.has(admin._id) ? (
+                            <span className="text-emerald-600 dark:text-emerald-400">Typing...</span>
+                          ) : (
+                            admin.lastMessage || 'No messages yet'
+                          )}
+                        </div>
+                        {admin.unreadCount ? (
+                          <span className="min-w-[18px] h-[18px] flex items-center justify-center bg-emerald-600 text-white text-[10px] font-medium rounded-full">
+                            {admin.unreadCount}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+                  </button>
+                ))
+              ) : (
+                <div className="p-4 text-center">
+                  <MessageCircle size={24} className="mx-auto mb-2 text-gray-400" />
+                  <div className="text-sm text-gray-500 dark:text-gray-400">No admins found</div>
+                </div>
+              )}
+            </div>
+
+            <div className="p-3 border-t border-gray-200 dark:border-gray-700">
+              <button
+                onClick={handleLogout}
+                className="w-full py-2 px-3 rounded-lg text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors flex items-center justify-center gap-2 text-sm"
+              >
+                <LogOut size={16} />
+                <span>Logout</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Chat Area */}
+        <div className="flex-1 flex flex-col bg-gray-50 dark:bg-gray-900">
+          {activeChat ? (
+            <>
+              <div className="flex-1 overflow-y-auto p-3 space-y-3">
+                {messages.length > 0 ? (
+                  messages.map((msg, index) => {
+                    const isUser = msg.sender === "user";
+                    const showAvatar = index === 0 ||
+                      messages[index - 1]?.sender !== msg.sender;
+
+                    return (
+                      <div
+                        key={msg.id || msg._id || index}
+                        className={`flex ${isUser ? 'justify-end' : 'justify-start'} items-end gap-1`}
+                      >
+                        {!isUser && showAvatar && (
+                          <div className="w-6 h-6 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center flex-shrink-0">
+                            <MessageCircle size={12} className="text-emerald-600 dark:text-emerald-400" />
+                          </div>
+                        )}
+                        {!isUser && !showAvatar && <div className="w-6" />}
+
+                        <div className="max-w-[85%] sm:max-w-[70%]">
+                          {showAvatar && !isUser && msg.sender !== 'system' && (
+                            <div className="text-[10px] text-gray-500 dark:text-gray-400 ml-1 mb-0.5">
+                              {msg.userName || 'Admin'}
+                            </div>
+                          )}
+
+                          <div
+                            className={`
+                              rounded-2xl px-3 py-2 relative group
+                              ${isUser
+                                ? 'bg-emerald-600 text-white rounded-br-none'
+                                : msg.sender === 'system'
+                                  ? 'bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300 text-center text-xs'
+                                  : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700 rounded-bl-none'
+                              }
+                            `}
+                          >
+                            {msg.text && (
+                              <div className="text-sm leading-relaxed whitespace-pre-wrap break-words">
+                                {msg.text}
+                              </div>
+                            )}
+
+                            {(msg.attachments && msg.attachments.length > 0) && (
+                              <div className="space-y-1.5 mt-1.5">
+                                {msg.attachments.map((att: any) => (
+                                  <div key={att.id} className="space-y-1">
+                                    {att.type === "image" && (
+                                      <div className="relative group">
+                                        <img
+                                          src={att.url}
+                                          alt={att.name || "Image"}
+                                          className="rounded-lg max-h-40 w-full object-cover cursor-pointer hover:opacity-90 transition"
+                                          onClick={() => window.open(att.url, '_blank')}
+                                        />
+                                        <button
+                                          onClick={() => downloadAttachment(att.url, att.name)}
+                                          className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition bg-black/50 text-white p-1.5 rounded-full"
+                                        >
+                                          <Download size={14} />
+                                        </button>
+                                      </div>
+                                    )}
+                                    {att.type === "video" && (
+                                      <video
+                                        src={att.url}
+                                        controls
+                                        className="rounded-lg max-h-40 w-full"
+                                      />
+                                    )}
+                                    {att.type === "document" && (
+                                      <a
+                                        href={att.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="flex items-center gap-2 p-2 bg-black/5 dark:bg-white/5 rounded-lg text-xs hover:bg-black/10 dark:hover:bg-white/10 transition"
+                                      >
+                                        <FileText size={14} />
+                                        <span className="truncate flex-1">{att.name || 'Document'}</span>
+                                        <Download size={14} className="opacity-70" />
+                                      </a>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            <div className="flex items-center justify-end gap-0.5 mt-1">
+                              <span className="text-[8px] opacity-60">
+                                {formatMessageTime(msg.timestamp)}
+                              </span>
+                              {isUser && (
+                                <span className="flex items-center ml-0.5">
+                                  {renderMessageStatus(msg)}
+                                </span>
+                              )}
+                            </div>
+
+                            {msg.text && (
+                              <button
+                                onClick={() => copyMessage(msg.text!)}
+                                className="absolute -top-2 -right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-gray-800 text-white rounded-full p-1 shadow-lg"
+                              >
+                                <Copy size={10} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="h-full flex items-center justify-center">
+                    <div className="text-center">
+                      <MessageCircle size={40} className="mx-auto mb-3 text-gray-400" />
+                      <div className="text-gray-500 dark:text-gray-400">No messages yet</div>
+                      <div className="text-sm text-gray-400 dark:text-gray-500">Start the conversation!</div>
+                    </div>
+                  </div>
+                )}
+                <div ref={messagesEndRef} />
+              </div>
+
+              <div className="bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 p-2">
+                {replyingTo && (
+                  <div className="mb-2 p-2 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-between">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs text-gray-500 dark:text-gray-400">Replying to:</div>
+                      <div className="text-sm text-gray-900 dark:text-white truncate">
+                        {replyingTo.text || '📎 Attachment'}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setReplyingTo(null)}
+                      className="p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                )}
+
+                {attachments.length > 0 && (
+                  <div className="flex gap-1.5 mb-2 overflow-x-auto pb-1">
+                    {attachments.map((att) => (
+                      <div key={att.id} className="relative min-w-[40px] h-10 border border-gray-200 dark:border-gray-700 rounded bg-gray-50 dark:bg-gray-900">
+                        <button
+                          onClick={() => removeAttachment(att.id)}
+                          className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 shadow-sm hover:bg-red-600"
+                        >
+                          <X size={8} />
+                        </button>
+
+                        {att.type === 'image' && att.preview && (
+                          <img
+                            src={att.preview}
+                            alt="Preview"
+                            className="w-full h-full object-cover rounded"
+                          />
+                        )}
+
+                        {att.type === 'document' && (
+                          <div className="flex items-center justify-center h-full">
+                            <FileText size={14} className="text-gray-400" />
+                          </div>
+                        )}
+
+                        {uploadProgress[att.file.name] !== undefined && (
+                          <div className="absolute inset-0 bg-black/50 rounded flex items-center justify-center">
+                            <span className="text-white text-[8px] font-bold">
+                              {uploadProgress[att.file.name]}%
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex items-end gap-1">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={handleFilePick}
+                    accept="image/*,video/*,.pdf,.doc,.docx,.txt"
+                  />
+
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isUploading}
+                    className="p-2.5 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-full transition-colors disabled:opacity-50"
+                  >
+                    <Paperclip size={18} />
+                  </button>
+
+                  <div className="flex-1 relative">
+                    <textarea
+                      ref={textareaRef}
+                      value={draft}
+                      onChange={(e) => setDraft(e.target.value)}
+                      onKeyPress={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSend();
+                        }
+                      }}
+                      disabled={isUploading}
+                      className="w-full border border-gray-200 dark:border-gray-700 rounded-2xl py-2 px-3 pr-10 max-h-24 resize-none bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-white placeholder-gray-400 focus:ring-2 focus:ring-emerald-500 focus:border-transparent outline-none text-sm"
+                      placeholder="Type a message..."
+                      rows={1}
+                    />
+
+                    {draft.trim() && (
+                      <button
+                        onClick={handleSend}
+                        disabled={isUploading}
+                        className="absolute right-1.5 bottom-1.5 p-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors disabled:opacity-50"
+                      >
+                        <CornerDownLeft size={14} />
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={handleSend}
+                    disabled={isUploading || (!draft.trim() && attachments.length === 0)}
+                    className="p-2.5 bg-emerald-600 text-white rounded-full disabled:opacity-50 shadow-sm hover:bg-emerald-700 transition-colors"
+                  >
+                    {isUploading ? (
+                      <Loader2 className="animate-spin" size={18} />
+                    ) : (
+                      <Send size={18} />
+                    )}
+                  </button>
+                </div>
+
+                {typingUsers.size > 0 && activeChat && typingUsers.has(activeChat._id) && (
+                  <div className="flex items-center gap-1 mt-1.5">
+                    <div className="flex space-x-0.5">
+                      <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                      <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                    </div>
+                    <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                      Someone is typing...
+                    </span>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="h-full flex items-center justify-center">
+              <div className="text-center px-4">
+                <MessageCircle size={40} className="mx-auto mb-3 text-gray-400" />
+                <div className="text-gray-600 dark:text-gray-400 text-sm">Select an admin to start messaging</div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <div className="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center p-4 z-30">
+          <div className="bg-white dark:bg-gray-800 rounded-t-xl sm:rounded-xl w-full max-w-sm p-4 animate-slide-up">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Settings</h3>
+              <button
+                onClick={() => setShowSettings(false)}
+                className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div className="p-3 bg-gray-50 dark:bg-gray-900/50 rounded-lg">
+                <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">Logged in as</div>
+                <div className="font-medium text-gray-900 dark:text-white text-sm">{currentUser.name}</div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 mt-1 break-all">{currentUser._id}</div>
+              </div>
+
+              <button
+                onClick={() => setIsDarkMode(!isDarkMode)}
+                className="w-full p-3 flex items-center justify-between hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+              >
+                <span className="text-sm text-gray-700 dark:text-gray-300 flex items-center gap-2">
+                  {isDarkMode ? <Sun size={16} /> : <Moon size={16} />}
+                  {isDarkMode ? 'Light Mode' : 'Dark Mode'}
+                </span>
+                <span className="text-xs text-gray-500">Toggle</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setNotificationsEnabled(!notificationsEnabled);
+                  localStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, String(!notificationsEnabled));
+                }}
+                className="w-full p-3 flex items-center justify-between hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+              >
+                <span className="text-sm text-gray-700 dark:text-gray-300 flex items-center gap-2">
+                  {notificationsEnabled ? <Bell size={16} /> : <BellOff size={16} />}
+                  Notifications
+                </span>
+                <span className="text-xs text-gray-500">{notificationsEnabled ? 'On' : 'Off'}</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  const newState = !soundEnabled;
+                  setSoundEnabled(newState);
+                  localStorage.setItem(STORAGE_KEYS.SOUND, String(newState));
+                }}
+                className="w-full p-3 flex items-center justify-between hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+              >
+                <span className="text-sm text-gray-700 dark:text-gray-300 flex items-center gap-2">
+                  {soundEnabled ? <Bell size={16} /> : <BellOff size={16} />}
+                  Sound Effects
+                </span>
+                <span className="text-xs text-gray-500">{soundEnabled ? 'On' : 'Off'}</span>
+              </button>
+
+              <div className="p-3 bg-gray-50 dark:bg-gray-900/50 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-700 dark:text-gray-300 flex items-center gap-2">
+                    {isConnected ? <Wifi size={16} className="text-green-500" /> : <WifiOff size={16} className="text-red-500" />}
+                    Connection
+                  </span>
+                  <span className={`text-xs ${isConnected ? 'text-green-500' : 'text-red-500'}`}>
+                    {isConnected ? 'Connected' : 'Disconnected'}
+                  </span>
+                </div>
+              </div>
+
+              <button
+                onClick={() => {
+                  handleLogout();
+                  setShowSettings(false);
+                }}
+                className="w-full p-3 rounded-lg bg-red-500 hover:bg-red-600 text-white font-medium transition-colors flex items-center justify-center gap-2 text-sm"
+              >
+                <LogOut size={16} />
+                <span>Logout</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-4 sm:max-w-sm bg-red-500 text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-3 animate-slide-up z-40">
+          <AlertCircle size={18} className="flex-shrink-0" />
+          <span className="text-sm flex-1">{error}</span>
+          <button onClick={() => setError(null)} className="p-1 hover:bg-white/20 rounded">
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      {success && (
+        <div className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-4 sm:max-w-sm bg-emerald-500 text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-3 animate-slide-up z-40">
+          <CheckCircle size={18} className="flex-shrink-0" />
+          <span className="text-sm flex-1">{success}</span>
+          <button onClick={() => setSuccess(null)} className="p-1 hover:bg-white/20 rounded">
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      {!isConnected && (
+        <div className="fixed top-0 left-0 right-0 bg-yellow-500 text-white text-center py-1 text-xs z-50">
+          Connection lost. Reconnecting...
+        </div>
+      )}
+    </div>
+  );
+}
