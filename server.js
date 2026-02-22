@@ -25,18 +25,13 @@ const PORT = process.env.PORT || 4000;
 
 app.use(cors({
   origin: [
-    "https://www.vizit.homes",
-    "https://dashboard.vizit.homes",
-    "https://vizithomes.vercel.app",
     "https://support.vizit.homes",
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "https://vizit-seven.vercel.app",
-    "https://wicichats.vercel.app",
-    "https://vizit-homes-k2n7.onrender.com",
-    "http://169.254.237.117:8080",
-    "http://localhost:8080",
-    "http://192.168.43.221:8080",
+    "https://dashboard.vizit.homes",
+    "https://www.vizit.homes",
+
+    "https://vizithomes.vercel.app",
+     "https://vizit.homes", "http://localhost:8080", "http://localhost:8081"
+
   ],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],

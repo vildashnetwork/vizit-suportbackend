@@ -7,7 +7,8 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: ["http://localhost:3000", "http://localhost:8080", "http://localhost:8081"],
+        origin: ["https://dashboard.vizit.homes", "https://support.vizit.homes",
+            , "https://vizit.homes", "http://localhost:8080", "http://localhost:8081"],
         credentials: true,
         methods: ["GET", "POST"]
     },
